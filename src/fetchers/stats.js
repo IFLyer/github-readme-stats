@@ -8,57 +8,19 @@ import { retryer } from "../common/retryer.js";
 import { logger } from "../common/log.js";
 import { excludeRepositories } from "../common/envs.js";
 import { CustomError, MissingParamError } from "../common/error.js";
-import { wrapTextMultiline } from "../common/fmt.js";
 import { request } from "../common/http.js";
 
 dotenv.config();
 
-// GraphQL queries.
-const GRAPHQL_REPOS_FIELD = `
-  repositories(first: 100, ownerAffiliations: OWNER, orderBy: {direction: DESC, field: STARGAZERS}, after: $after) {
-    totalCount
-    nodes {
-      name
-      stargazers {
-        totalCount
-      }
-    }
-    pageInfo {
-      hasNextPage
-      endCursor
-    }
-  }
-`;
-
-const GRAPHQL_REPOS_QUERY = `
-  query userInfo($login: String!, $after: String) {
-    user(login: $login) {
-      ${GRAPHQL_REPOS_FIELD}
-    }
-  }
-`;
+// Fine-grained personal access tokens cannot access several user-level
+// GraphQL connections (contributionsCollection, stargazers, ...), so all
+// stats are fetched via the REST API. GraphQL is only used for the fields
+// that have no REST equivalent, with a graceful fallback to zero.
 
 const GRAPHQL_STATS_QUERY = `
-  query userInfo($login: String!, $after: String, $includeMergedPullRequests: Boolean!, $includeDiscussions: Boolean!, $includeDiscussionsAnswers: Boolean!) {
+  query userInfo($login: String!, $includeDiscussions: Boolean!, $includeDiscussionsAnswers: Boolean!) {
     user(login: $login) {
-      name
-      login
       repositoriesContributedTo(first: 1, contributionTypes: [COMMIT, ISSUE, PULL_REQUEST, REPOSITORY]) {
-        totalCount
-      }
-      pullRequests(first: 1) {
-        totalCount
-      }
-      mergedPullRequests: pullRequests(states: MERGED) @include(if: $includeMergedPullRequests) {
-        totalCount
-      }
-      openIssues: issues(states: OPEN) {
-        totalCount
-      }
-      closedIssues: issues(states: CLOSED) {
-        totalCount
-      }
-      followers {
         totalCount
       }
       repositoryDiscussions @include(if: $includeDiscussions) {
@@ -67,23 +29,22 @@ const GRAPHQL_STATS_QUERY = `
       repositoryDiscussionComments(onlyAnswers: true) @include(if: $includeDiscussionsAnswers) {
         totalCount
       }
-      ${GRAPHQL_REPOS_FIELD}
     }
   }
 `;
 
 /**
- * Stats fetcher object.
+ * Optional GraphQL fetcher for fields without a REST equivalent.
+ * Errors are tolerated by the caller (fields fall back to zero).
  *
- * @param {object & { after: string | null }} variables Fetcher variables.
+ * @param {any} variables Fetcher variables.
  * @param {string} token GitHub token.
  * @returns {Promise<import('axios').AxiosResponse>} Axios response.
  */
-const fetcher = (variables, token) => {
-  const query = variables.after ? GRAPHQL_REPOS_QUERY : GRAPHQL_STATS_QUERY;
+const graphqlFetcher = (variables, token) => {
   return request(
     {
-      query,
+      query: GRAPHQL_STATS_QUERY,
       variables,
     },
     {
@@ -93,183 +54,80 @@ const fetcher = (variables, token) => {
 };
 
 /**
- * Fetch stats information for a given username.
+ * Send a GET request to the GitHub REST API.
  *
- * @param {object} variables Fetcher variables.
- * @param {string} variables.username GitHub username.
- * @param {boolean} variables.includeMergedPullRequests Include merged pull requests.
- * @param {boolean} variables.includeDiscussions Include discussions.
- * @param {boolean} variables.includeDiscussionsAnswers Include discussions answers.
- * @param {string|undefined} variables.startTime Time to start the count of total commits.
- * @returns {Promise<import('axios').AxiosResponse>} Axios response.
- *
- * @description This function supports multi-page fetching if the 'FETCH_MULTI_PAGE_STARS' environment variable is set to true.
- */
-const statsFetcher = async ({
-  username,
-  includeMergedPullRequests,
-  includeDiscussions,
-  includeDiscussionsAnswers,
-}) => {
-  let stats;
-  let hasNextPage = true;
-  let endCursor = null;
-  while (hasNextPage) {
-    const variables = {
-      login: username,
-      first: 100,
-      after: endCursor,
-      includeMergedPullRequests,
-      includeDiscussions,
-      includeDiscussionsAnswers,
-    };
-    let res = await retryer(fetcher, variables);
-    if (res.data.errors) {
-      return res;
-    }
-
-    // Store stats data.
-    const repoNodes = res.data.data.user.repositories.nodes;
-    if (stats) {
-      stats.data.data.user.repositories.nodes.push(...repoNodes);
-    } else {
-      stats = res;
-    }
-
-    // Disable multi page fetching on public Vercel instance due to rate limits.
-    const repoNodesWithStars = repoNodes.filter(
-      (node) => node.stargazers.totalCount !== 0,
-    );
-    hasNextPage =
-      process.env.FETCH_MULTI_PAGE_STARS === "true" &&
-      repoNodes.length === repoNodesWithStars.length &&
-      res.data.data.user.repositories.pageInfo.hasNextPage;
-    endCursor = res.data.data.user.repositories.pageInfo.endCursor;
-  }
-
-  return stats;
-};
-
-/**
- * Fetch total commits using the REST API.
- *
- * @param {object} variables Fetcher variables.
+ * @param {string} url Request URL.
  * @param {string} token GitHub token.
  * @returns {Promise<import('axios').AxiosResponse>} Axios response.
- *
- * @see https://developer.github.com/v3/search/#search-commits
  */
-const fetchTotalCommits = (variables, token) => {
-  const dateFilter = variables.year
-    ? `+committer-date:${variables.year}-01-01..${variables.year}-12-31`
-    : "";
+const restGet = (url, token) => {
   return axios({
     method: "get",
-    url: `https://api.github.com/search/commits?q=author:${variables.login}${dateFilter}`,
+    url,
     headers: {
       "Content-Type": "application/json",
-      Accept: "application/vnd.github.cloak-preview",
+      Accept: "application/vnd.github+json",
       Authorization: `token ${token}`,
     },
   });
 };
 
+const fetchUserInfo = (variables, token) =>
+  restGet(`https://api.github.com/users/${variables.login}`, token);
+
+const fetchTokenOwner = (_variables, token) =>
+  restGet("https://api.github.com/user", token);
+
+const fetchReposPage = (variables, token) =>
+  restGet(
+    variables.selfRepos
+      ? `https://api.github.com/user/repos?affiliation=owner&per_page=100&page=${variables.page}`
+      : `https://api.github.com/users/${variables.login}/repos?type=owner&per_page=100&page=${variables.page}`,
+    token,
+  );
+
+const fetchSearchCount = (variables, token) =>
+  restGet(
+    `https://api.github.com/search/${variables.endpoint}?q=${variables.query}&per_page=1`,
+    token,
+  );
+
 /**
- * Fetch all the commits for all the repositories of a given username.
+ * Run a REST search query and return its total_count.
  *
- * @param {string} username GitHub username.
- * @returns {Promise<number>} Total commits.
- *
- * @description Done like this because the GitHub API does not provide a way to fetch all the commits. See
- * #92#issuecomment-661026467 and #211 for more information.
+ * @param {string} query Search query (already `+` separated).
+ * @param {string} endpoint Search endpoint: "issues" or "commits".
+ * @param {string} label Human readable label for error messages.
+ * @returns {Promise<number>} Result count.
  */
-const totalCommitsFetcher = async (username, year) => {
-  if (!githubUsernameRegex.test(username)) {
-    logger.log("Invalid username provided.");
-    throw new Error("Invalid username provided.");
-  }
-
-  let res;
-  try {
-    res = await retryer(fetchTotalCommits, { login: username, year });
-  } catch (err) {
-    logger.log(err);
-    throw new Error(err);
-  }
-
-  const totalCount = res.data.total_count;
-  if (!totalCount || isNaN(totalCount)) {
+const searchTotal = async (query, endpoint, label) => {
+  const res = await retryer(fetchSearchCount, { query, endpoint });
+  const total = res.data.total_count;
+  if (isNaN(total)) {
     throw new CustomError(
-      "Could not fetch total commits.",
+      `Could not fetch ${label}.`,
       CustomError.GITHUB_REST_API_ERROR,
     );
   }
-  return totalCount;
-};
-
-/**
- * Fetch total pull request reviews using the REST search API.
- *
- * @param {object} variables Fetcher variables.
- * @param {string} token GitHub token.
- * @returns {Promise<import('axios').AxiosResponse>} Axios response.
- */
-const fetchTotalReviews = (variables, token) => {
-  return axios({
-    method: "get",
-    url: `https://api.github.com/search/issues?q=type:pr+reviewed-by:${variables.login}`,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `token ${token}`,
-    },
-  });
-};
-
-/**
- * Fetch the total number of pull requests reviewed by a given username.
- *
- * @param {string} username GitHub username.
- * @returns {Promise<number>} Total reviews.
- */
-const totalReviewsFetcher = async (username) => {
-  if (!githubUsernameRegex.test(username)) {
-    logger.log("Invalid username provided.");
-    throw new Error("Invalid username provided.");
-  }
-
-  let res;
-  try {
-    res = await retryer(fetchTotalReviews, { login: username });
-  } catch (err) {
-    logger.log(err);
-    throw new Error(err);
-  }
-
-  const totalCount = res.data.total_count;
-  if (isNaN(totalCount)) {
-    throw new CustomError(
-      "Could not fetch total reviews.",
-      CustomError.GITHUB_REST_API_ERROR,
-    );
-  }
-  return totalCount || 0;
+  return total || 0;
 };
 
 /**
  * Fetch stats for a given username.
  *
  * @param {string} username GitHub username.
- * @param {boolean} include_all_commits Include all commits.
+ * @param {boolean} _includeAllCommits Kept for API compatibility; commits are
+ * always counted across all time via the REST search API.
  * @param {string[]} exclude_repo Repositories to exclude.
  * @param {boolean} include_merged_pull_requests Include merged pull requests.
  * @param {boolean} include_discussions Include discussions.
  * @param {boolean} include_discussions_answers Include discussions answers.
- * @param {number|undefined} commits_year Year to count total commits
+ * @param {number|undefined} commits_year Year to count total commits.
  * @returns {Promise<import("./types").StatsData>} Stats data.
  */
 const fetchStats = async (
   username,
-  include_all_commits = false,
+  _includeAllCommits = false,
   exclude_repo = [],
   include_merged_pull_requests = false,
   include_discussions = false,
@@ -278,6 +136,14 @@ const fetchStats = async (
 ) => {
   if (!username) {
     throw new MissingParamError(["username"]);
+  }
+
+  if (!githubUsernameRegex.test(username)) {
+    logger.log("Invalid username provided.");
+    throw new CustomError(
+      "Invalid username provided.",
+      CustomError.GITHUB_REST_API_ERROR,
+    );
   }
 
   const stats = {
@@ -295,72 +161,94 @@ const fetchStats = async (
     rank: { level: "C", percentile: 100 },
   };
 
-  let res = await statsFetcher({
-    username,
-    includeMergedPullRequests: include_merged_pull_requests,
-    includeDiscussions: include_discussions,
-    includeDiscussionsAnswers: include_discussions_answers,
-  });
+  const dateFilter = commits_year
+    ? `+committer-date:${commits_year}-01-01..${commits_year}-12-31`
+    : "";
 
-  // Catch GraphQL errors.
-  if (res.data.errors) {
-    logger.error(res.data.errors);
-    if (res.data.errors[0].type === "NOT_FOUND") {
-      throw new CustomError(
-        res.data.errors[0].message || "Could not fetch user.",
-        CustomError.USER_NOT_FOUND,
-      );
-    }
-    if (res.data.errors[0].message) {
-      throw new CustomError(
-        wrapTextMultiline(res.data.errors[0].message, 90, 1)[0],
-        res.statusText,
-      );
-    }
-    throw new CustomError(
-      "Something went wrong while trying to retrieve the stats data using the GraphQL API.",
-      CustomError.GRAPHQL_ERROR,
-    );
-  }
+  // Fetch everything independent in parallel.
+  const [
+    userInfoRes,
+    tokenOwnerRes,
+    totalCommits,
+    totalPRs,
+    totalPRsMerged,
+    totalIssues,
+    totalReviews,
+  ] = await Promise.all([
+    retryer(fetchUserInfo, { login: username }),
+    retryer(fetchTokenOwner, {}),
+    searchTotal(`author:${username}${dateFilter}`, "commits", "total commits"),
+    searchTotal(`type:pr+author:${username}`, "issues", "total pull requests"),
+    include_merged_pull_requests
+      ? searchTotal(
+          `type:pr+author:${username}+is:merged`,
+          "issues",
+          "merged pull requests",
+        )
+      : Promise.resolve(0),
+    searchTotal(`type:issue+author:${username}`, "issues", "total issues"),
+    searchTotal(`type:pr+reviewed-by:${username}`, "issues", "total reviews"),
+  ]);
 
-  const user = res.data.data.user;
+  stats.name = userInfoRes.data.name || username;
+  stats.totalCommits = totalCommits;
+  stats.totalPRs = totalPRs;
+  stats.totalPRsMerged = totalPRsMerged;
+  stats.mergedPRsPercentage =
+    include_merged_pull_requests && totalPRs
+      ? (totalPRsMerged / totalPRs) * 100
+      : 0;
+  stats.totalIssues = totalIssues;
+  stats.totalReviews = totalReviews;
 
-  stats.name = user.name || user.login;
-
-  // commits and reviews are fetched via the REST search API so that
-  // fine-grained personal access tokens work (they cannot access the
-  // GraphQL contributionsCollection field).
-  stats.totalCommits = await totalCommitsFetcher(username, commits_year);
-
-  stats.totalPRs = user.pullRequests.totalCount;
-  if (include_merged_pull_requests) {
-    stats.totalPRsMerged = user.mergedPullRequests.totalCount;
-    stats.mergedPRsPercentage =
-      (user.mergedPullRequests.totalCount / user.pullRequests.totalCount) *
-        100 || 0;
-  }
-  stats.totalReviews = await totalReviewsFetcher(username);
-  stats.totalIssues = user.openIssues.totalCount + user.closedIssues.totalCount;
-  if (include_discussions) {
-    stats.totalDiscussionsStarted = user.repositoryDiscussions.totalCount;
-  }
-  if (include_discussions_answers) {
-    stats.totalDiscussionsAnswered =
-      user.repositoryDiscussionComments.totalCount;
-  }
-  stats.contributedTo = user.repositoriesContributedTo.totalCount;
-
-  // Retrieve stars while filtering out repositories to be hidden.
+  // Repositories: when the requested user owns the PAT, /user/repos also
+  // returns private repositories (the reason this instance is self-hosted).
+  const selfRepos =
+    tokenOwnerRes.data?.login?.toLowerCase() === username.toLowerCase();
   const allExcludedRepos = [...exclude_repo, ...excludeRepositories];
-  let repoToHide = new Set(allExcludedRepos);
+  const repoToHide = new Set(allExcludedRepos);
 
-  stats.totalStars = user.repositories.nodes
-    .filter((data) => {
-      return !repoToHide.has(data.name);
-    })
-    .reduce((prev, curr) => {
-      return prev + curr.stargazers.totalCount;
-    }, 0);
+  let repos = [];
+  let page = 1;
+  for (;;) {
+    const res = await retryer(fetchReposPage, {
+      login: username,
+      selfRepos,
+      page,
+    });
+    repos.push(...res.data);
+    if (res.data.length < 100) break;
+    page++;
+  }
+
+  stats.totalStars = repos
+    .filter((repo) => !repoToHide.has(repo.name))
+    .reduce((total, repo) => total + repo.stargazers_count, 0);
+
+  // Optional GraphQL fields — gracefully degrade to zero when the token
+  // type cannot access them.
+  try {
+    const res = await retryer(graphqlFetcher, {
+      login: username,
+      includeDiscussions: include_discussions,
+      includeDiscussionsAnswers: include_discussions_answers,
+    });
+    if (res.data.errors) {
+      logger.error(res.data.errors);
+    } else {
+      const user = res.data.data.user;
+      stats.contributedTo = user.repositoriesContributedTo.totalCount;
+      if (include_discussions) {
+        stats.totalDiscussionsStarted = user.repositoryDiscussions.totalCount;
+      }
+      if (include_discussions_answers) {
+        stats.totalDiscussionsAnswered =
+          user.repositoryDiscussionComments.totalCount;
+      }
+    }
+  } catch (err) {
+    logger.error(err);
+  }
 
   stats.rank = calculateRank({
     all_commits: true,
@@ -368,9 +256,9 @@ const fetchStats = async (
     prs: stats.totalPRs,
     reviews: stats.totalReviews,
     issues: stats.totalIssues,
-    repos: user.repositories.totalCount,
+    repos: repos.length,
     stars: stats.totalStars,
-    followers: user.followers.totalCount,
+    followers: userInfoRes.data.followers,
   });
 
   return stats;

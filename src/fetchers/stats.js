@@ -39,16 +39,10 @@ const GRAPHQL_REPOS_QUERY = `
 `;
 
 const GRAPHQL_STATS_QUERY = `
-  query userInfo($login: String!, $after: String, $includeMergedPullRequests: Boolean!, $includeDiscussions: Boolean!, $includeDiscussionsAnswers: Boolean!, $startTime: DateTime = null) {
+  query userInfo($login: String!, $after: String, $includeMergedPullRequests: Boolean!, $includeDiscussions: Boolean!, $includeDiscussionsAnswers: Boolean!) {
     user(login: $login) {
       name
       login
-      commits: contributionsCollection (from: $startTime) {
-        totalCommitContributions,
-      }
-      reviews: contributionsCollection {
-        totalPullRequestReviewContributions
-      }
       repositoriesContributedTo(first: 1, contributionTypes: [COMMIT, ISSUE, PULL_REQUEST, REPOSITORY]) {
         totalCount
       }
@@ -116,7 +110,6 @@ const statsFetcher = async ({
   includeMergedPullRequests,
   includeDiscussions,
   includeDiscussionsAnswers,
-  startTime,
 }) => {
   let stats;
   let hasNextPage = true;
@@ -129,7 +122,6 @@ const statsFetcher = async ({
       includeMergedPullRequests,
       includeDiscussions,
       includeDiscussionsAnswers,
-      startTime,
     };
     let res = await retryer(fetcher, variables);
     if (res.data.errors) {
@@ -168,9 +160,12 @@ const statsFetcher = async ({
  * @see https://developer.github.com/v3/search/#search-commits
  */
 const fetchTotalCommits = (variables, token) => {
+  const dateFilter = variables.year
+    ? `+committer-date:${variables.year}-01-01..${variables.year}-12-31`
+    : "";
   return axios({
     method: "get",
-    url: `https://api.github.com/search/commits?q=author:${variables.login}`,
+    url: `https://api.github.com/search/commits?q=author:${variables.login}${dateFilter}`,
     headers: {
       "Content-Type": "application/json",
       Accept: "application/vnd.github.cloak-preview",
@@ -188,7 +183,7 @@ const fetchTotalCommits = (variables, token) => {
  * @description Done like this because the GitHub API does not provide a way to fetch all the commits. See
  * #92#issuecomment-661026467 and #211 for more information.
  */
-const totalCommitsFetcher = async (username) => {
+const totalCommitsFetcher = async (username, year) => {
   if (!githubUsernameRegex.test(username)) {
     logger.log("Invalid username provided.");
     throw new Error("Invalid username provided.");
@@ -196,7 +191,7 @@ const totalCommitsFetcher = async (username) => {
 
   let res;
   try {
-    res = await retryer(fetchTotalCommits, { login: username });
+    res = await retryer(fetchTotalCommits, { login: username, year });
   } catch (err) {
     logger.log(err);
     throw new Error(err);
@@ -210,6 +205,54 @@ const totalCommitsFetcher = async (username) => {
     );
   }
   return totalCount;
+};
+
+/**
+ * Fetch total pull request reviews using the REST search API.
+ *
+ * @param {object} variables Fetcher variables.
+ * @param {string} token GitHub token.
+ * @returns {Promise<import('axios').AxiosResponse>} Axios response.
+ */
+const fetchTotalReviews = (variables, token) => {
+  return axios({
+    method: "get",
+    url: `https://api.github.com/search/issues?q=type:pr+reviewed-by:${variables.login}`,
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `token ${token}`,
+    },
+  });
+};
+
+/**
+ * Fetch the total number of pull requests reviewed by a given username.
+ *
+ * @param {string} username GitHub username.
+ * @returns {Promise<number>} Total reviews.
+ */
+const totalReviewsFetcher = async (username) => {
+  if (!githubUsernameRegex.test(username)) {
+    logger.log("Invalid username provided.");
+    throw new Error("Invalid username provided.");
+  }
+
+  let res;
+  try {
+    res = await retryer(fetchTotalReviews, { login: username });
+  } catch (err) {
+    logger.log(err);
+    throw new Error(err);
+  }
+
+  const totalCount = res.data.total_count;
+  if (isNaN(totalCount)) {
+    throw new CustomError(
+      "Could not fetch total reviews.",
+      CustomError.GITHUB_REST_API_ERROR,
+    );
+  }
+  return totalCount || 0;
 };
 
 /**
@@ -257,7 +300,6 @@ const fetchStats = async (
     includeMergedPullRequests: include_merged_pull_requests,
     includeDiscussions: include_discussions,
     includeDiscussionsAnswers: include_discussions_answers,
-    startTime: commits_year ? `${commits_year}-01-01T00:00:00Z` : undefined,
   });
 
   // Catch GraphQL errors.
@@ -285,12 +327,10 @@ const fetchStats = async (
 
   stats.name = user.name || user.login;
 
-  // if include_all_commits, fetch all commits using the REST API.
-  if (include_all_commits) {
-    stats.totalCommits = await totalCommitsFetcher(username);
-  } else {
-    stats.totalCommits = user.commits.totalCommitContributions;
-  }
+  // commits and reviews are fetched via the REST search API so that
+  // fine-grained personal access tokens work (they cannot access the
+  // GraphQL contributionsCollection field).
+  stats.totalCommits = await totalCommitsFetcher(username, commits_year);
 
   stats.totalPRs = user.pullRequests.totalCount;
   if (include_merged_pull_requests) {
@@ -299,7 +339,7 @@ const fetchStats = async (
       (user.mergedPullRequests.totalCount / user.pullRequests.totalCount) *
         100 || 0;
   }
-  stats.totalReviews = user.reviews.totalPullRequestReviewContributions;
+  stats.totalReviews = await totalReviewsFetcher(username);
   stats.totalIssues = user.openIssues.totalCount + user.closedIssues.totalCount;
   if (include_discussions) {
     stats.totalDiscussionsStarted = user.repositoryDiscussions.totalCount;
@@ -323,7 +363,7 @@ const fetchStats = async (
     }, 0);
 
   stats.rank = calculateRank({
-    all_commits: include_all_commits,
+    all_commits: true,
     commits: stats.totalCommits,
     prs: stats.totalPRs,
     reviews: stats.totalReviews,
